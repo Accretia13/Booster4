@@ -1,169 +1,157 @@
-import httpx
 import os
+import sqlite3
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-import time
-import asyncio
-from asyncio import Semaphore
+import numpy as np
+from tqdm import tqdm
 
 # === Параметры ===
-BASE_URL = "https://www.okx.com"
-CANDLE_ENDPOINT = "/api/v5/market/candles"
-OUTPUT_DIR = "./data_live"
-VOL_THRESHOLD_M = 30.0
-MAX_CONCURRENT_REQUESTS = 3  # Снижен лимит
-TFS = {
-    "3m": {"bar": "3m", "limit": 100, "filename": "_3m.txt", "per": 3},
-    "1h": {"bar": "1H", "limit": 100, "filename": "_1h.txt", "per": 60},
-    "1d": {"bar": "1Dutc", "limit": 100, "filename": "_1d.txt", "per": 1440},
+TF_PARAMS = {
+    "3mtf": {
+        "folder": r"C:\\Users\\777\\PycharmProjects\\Booster4\\scoring_p\\datasets\\3mtf",
+        "window": 20,
+        "time_column": "TIME",
+        "date_column": "DATE",
+        "start_minute": "00"
+    },
+    "1htf": {
+        "folder": r"C:\\Users\\777\\PycharmProjects\\Booster4\\scoring_p\\datasets\\1htf",
+        "window": 24,
+        "time_column": "TIME",
+        "date_column": "DATE",
+        "start_hour": "03"
+    },
+    "1dtf": {
+        "folder": r"C:\\Users\\777\\PycharmProjects\\Booster4\\scoring_p\\datasets\\1dtf",
+        "source_3mtf": r"C:\\Users\\777\\PycharmProjects\\Booster4\\scoring_p\\datasets\\3mtf"
+    }
 }
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# === Получение ликвидных тикеров ===
-def get_liquid_tickers_vol_millions(vol_threshold_m=30.0):
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
-    try:
-        response = httpx.get(url, timeout=10.0)
-        response.raise_for_status()
-        data = response.json().get("data", [])
-        total_tickers = len(data)
+def compute_hma_cross(df):
+    df.columns = [col.lower().strip() for col in df.columns]
+    hma9 = pd.to_numeric(df["hma9"], errors="coerce")
+    hma21 = pd.to_numeric(df["hma21"], errors="coerce")
+    cross = ((hma9 > hma21) & (hma9.shift(1) <= hma21.shift(1))) | ((hma9 < hma21) & (hma9.shift(1) >= hma21.shift(1)))
+    return cross.astype(int)
 
-        filtered = []
-        for item in data:
-            inst_id = item.get("instId", "")
-            vol_ccy_24h = float(item.get("volCcy24h", 0.0))
-            vol_millions = vol_ccy_24h / 1_000_000
-            if inst_id.endswith("USDT-SWAP") and vol_millions > vol_threshold_m:
-                transformed_id = inst_id.replace("-", "").upper()
-                filtered.append({
-                    "instId": inst_id,
-                    "transformedId": transformed_id,
-                    "volCcy24h_M": round(vol_millions, 3)
-                })
 
-        df = pd.DataFrame(filtered).sort_values(by="volCcy24h_M", ascending=False).reset_index(drop=True)
-        print(f"[INFO] Всего тикеров получено: {total_tickers}")
-        print(f"[INFO] Тикеров с объемом > {vol_threshold_m} млн $ в сутки: {len(filtered)}\n")
-        return df
+def process_3mtf():
+    p = TF_PARAMS["3mtf"]
+    for file in tqdm(os.listdir(p["folder"]), desc="3mtf"):
+        if not file.endswith(".sqlite"):
+            continue
+        path = os.path.join(p["folder"], file)
+        con = sqlite3.connect(path)
+        df = pd.read_sql_query("SELECT * FROM candles", con)
+        df.columns = [col.lower().strip() for col in df.columns]
 
-    except Exception as e:
-        print(f"[ERROR] Ошибка при получении тикеров: {e}")
-        return pd.DataFrame(columns=["instId", "transformedId", "volCcy24h_M"])
+        cross_flags = compute_hma_cross(df)
+        density = []
+        for i in range(len(df)):
+            if str(df.loc[i, p["time_column"].lower()])[-2:] == p["start_minute"]:
+                window_crosses = cross_flags[max(0, i - p["window"]):i].sum()
+                density.append(window_crosses)
+            else:
+                density.append(np.nan)
 
-# === Асинхронная загрузка и сохранение свечей с авто-повтором ===
-async def fetch_and_save_candles(inst_id: str, symbol_name: str, semaphore: Semaphore, client: httpx.AsyncClient):
-    header = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>"
-    async with semaphore:
-        for tf, tf_data in TFS.items():
-            params = {
-                "instId": inst_id,
-                "bar": tf_data["bar"],
-                "limit": tf_data["limit"]
-            }
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    resp = await client.get(BASE_URL + CANDLE_ENDPOINT, params=params, timeout=10.0)
-                    if resp.status_code == 429:
-                        raise httpx.HTTPStatusError("Too Many Requests", request=resp.request, response=resp)
-                    resp.raise_for_status()
-                    candles = resp.json()["data"]
-                    candles.reverse()
+        df["density_hma_cross"] = density
+        df.to_sql("candles", con, if_exists="replace", index=False)
+        con.close()
 
-                    lines = []
-                    for entry in candles:
-                        ts_utc = datetime.fromtimestamp(float(entry[0]) / 1000, tz=timezone.utc)
-                        ts_msk = ts_utc + timedelta(hours=3)
-                        # Привязка дня к 03:00 МСК (UTC+3)
-                        if tf.startswith("1d"):
-                            msk_day_boundary = ts_msk.replace(hour=3, minute=0, second=0, microsecond=0)
-                            if ts_msk < msk_day_boundary:
-                                ts_msk = msk_day_boundary - timedelta(days=1)
-                            else:
-                                ts_msk = msk_day_boundary
 
-                        date_str = ts_msk.strftime("%Y%m%d")
-                        time_str = ts_msk.strftime("%H%M%S")
+def process_1htf():
+    p = TF_PARAMS["1htf"]
+    folder_3m = TF_PARAMS["3mtf"]["folder"]
 
-                        open_p = float(entry[1])
-                        vol_base = float(entry[5])
-                        vol_quote = round(open_p * vol_base, 2)  # VOL в quote валюте (USDT)
+    for file in tqdm(os.listdir(p["folder"]), desc="1htf"):
+        if not file.endswith(".sqlite"):
+            continue
 
-                        line = f"{symbol_name},{tf_data['per']},{date_str},{time_str},{entry[1]},{entry[2]},{entry[3]},{entry[4]},{vol_quote}"
-                        lines.append(line)
+        base_name = file.replace("_1h.sqlite", "")
+        path_1h = os.path.join(p["folder"], file)
+        path_3m = os.path.join(folder_3m, base_name + "_3m.sqlite")
 
-                    filename = f"{symbol_name}{tf_data['filename']}"
-                    filepath = os.path.join(OUTPUT_DIR, filename)
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(header + "\n" + "\n".join(lines))
+        if not os.path.exists(path_3m):
+            continue
 
-                    break
+        con_1h = sqlite3.connect(path_1h)
+        con_3m = sqlite3.connect(path_3m)
 
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429:
-                        print(f"[!] 429 от OKX: {symbol_name} | {tf} — повтор через 2с...")
-                        await asyncio.sleep(2.0)
-                    else:
-                        print(f"[!] Ошибка {symbol_name} | {tf}: {e}")
-                        break
-                except Exception as e:
-                    print(f"[!] Ошибка: {symbol_name} | {tf} → {e}")
-                    break
-        await asyncio.sleep(0.25)
+        df_1h = pd.read_sql_query("SELECT * FROM candles", con_1h)
+        df_3m = pd.read_sql_query("SELECT * FROM candles", con_3m)
 
-# === Основной запуск ===
-async def main():
-    start_time = time.time()
-    tickers_df = get_liquid_tickers_vol_millions(VOL_THRESHOLD_M)
-    total = len(tickers_df)
+        df_1h.columns = [col.lower().strip() for col in df_1h.columns]
+        df_3m.columns = [col.lower().strip() for col in df_3m.columns]
 
-    semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
-    tasks = []
+        df_3m["hma_cross"] = compute_hma_cross(df_3m)
 
-    async with httpx.AsyncClient() as client:
-        for i, row in tickers_df.iterrows():
-            inst_id = row["instId"]
-            symbol_name = row["transformedId"]
-            task = fetch_and_save_candles(inst_id, symbol_name, semaphore, client)
-            tasks.append(task)
+        # Часовой ключ: YYYYMMDDHH
+        df_3m["datetime"] = pd.to_datetime(df_3m["date"] + df_3m["time"], format="%Y%m%d%H%M%S")
+        df_3m["hour_key"] = df_3m["datetime"].dt.strftime("%Y%m%d%H")
+        df_3m["minute"] = df_3m["datetime"].dt.minute
 
-        for i in range(0, len(tasks), 3):
-            await asyncio.gather(*tasks[i:i+3])
-            percent = int((i + 3) / total * 100)
-            print(f"[PROGRESS] {min(percent, 100)}% завершено")
+        # Фильтруем на начало каждого часа (MM == 00)
+        df_hourly = df_3m[df_3m["minute"] == 0]
+        density = df_3m[df_3m["hma_cross"] != 0].groupby("hour_key").size()
 
-    duration = round(time.time() - start_time, 2)
-    print(f"\n[FINISHED] Время выполнения: {duration} секунд")
+        df_1h["datetime"] = pd.to_datetime(df_1h["date"] + df_1h["time"], format="%Y%m%d%H%M%S")
+        df_1h["hour_key"] = df_1h["datetime"].dt.strftime("%Y%m%d%H")
+        df_1h["density_hma_cross"] = df_1h["hour_key"].map(density).fillna(0).astype(int)
 
-async def download_and_save_all_candles(vol_threshold: float = VOL_THRESHOLD_M) -> list:
-    start_time = time.time()
-    tickers_df = get_liquid_tickers_vol_millions(vol_threshold)
-    total = len(tickers_df)
+        df_1h.drop(columns=["datetime", "hour_key"], inplace=True)
+        df_1h.to_sql("candles", con_1h, if_exists="replace", index=False)
 
-    if tickers_df.empty:
-        print("[ERROR] Нет тикеров для загрузки")
-        return []
+        con_1h.close()
+        con_3m.close()
 
-    semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
-    tasks = []
 
-    async with httpx.AsyncClient() as client:
-        for _, row in tickers_df.iterrows():
-            inst_id = row["instId"]
-            symbol_name = row["transformedId"]
-            task = fetch_and_save_candles(inst_id, symbol_name, semaphore, client)
-            tasks.append(task)
 
-        for i in range(0, len(tasks), MAX_CONCURRENT_REQUESTS):
-            await asyncio.gather(*tasks[i:i + MAX_CONCURRENT_REQUESTS])
-            percent = int((i + MAX_CONCURRENT_REQUESTS) / total * 100)
-            print(f"[PROGRESS] {min(percent, 100)}% завершено")
+def process_1dtf():
+    p = TF_PARAMS["1dtf"]
+    folder = p["folder"]
+    folder_1h = TF_PARAMS["1htf"]["folder"]
 
-    duration = round(time.time() - start_time, 2)
-    print(f"\n[FINISHED] Загружено {len(tickers_df)} тикеров за {duration} секунд")
+    for file in tqdm(os.listdir(folder), desc="1dtf"):
+        if not file.endswith(".sqlite"):
+            continue
 
-    return tickers_df["transformedId"].tolist()
+        path_1d = os.path.join(folder, file)
+        base_name = file.replace("_1d.sqlite", "")
+        path_1h = os.path.join(folder_1h, base_name + "_1h.sqlite")
+
+        if not os.path.exists(path_1h):
+            continue
+
+        # === Загрузка дневных и часовых свечей ===
+        con_day = sqlite3.connect(path_1d)
+        con_hour = sqlite3.connect(path_1h)
+
+        df_day = pd.read_sql_query("SELECT * FROM candles", con_day)
+        df_hour = pd.read_sql_query("SELECT * FROM candles", con_hour)
+
+        con_day.close()
+        con_hour.close()
+
+        # === Очистка HMA-столбцов ===
+        for col in ["hma9", "hma21", "hma_cross"]:
+            if col in df_day.columns:
+                df_day.drop(columns=[col], inplace=True)
+
+        # === Расчёт amp_eff_avg по дневной дате ===
+        df_hour.columns = [c.lower().strip() for c in df_hour.columns]
+        df_hour["date"] = df_hour["date"].astype(str)
+        df_hour["amp_eff"] = pd.to_numeric(df_hour.get("amplitude"), errors="coerce")
+
+        amp_eff_by_date = df_hour.groupby("date")["amp_eff"].mean().to_dict()
+        df_day["amp_eff_avg"] = df_day["date"].astype(str).map(amp_eff_by_date)
+
+        # === Сохранение обратно ===
+        con_day = sqlite3.connect(path_1d)
+        df_day.to_sql("candles", con_day, if_exists="replace", index=False)
+        con_day.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    process_3mtf()
+    process_1htf()
+    process_1dtf()
